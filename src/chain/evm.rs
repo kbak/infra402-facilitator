@@ -230,6 +230,9 @@ pub struct EvmProvider {
     eip712_version_cache: Arc<tokio::sync::RwLock<std::collections::HashMap<Address, (String, std::time::Instant)>>>,
     /// Token manager for dynamic contract selection based on token configuration
     token_manager: Arc<TokenManager>,
+    /// Use BlockId::latest() instead of BlockId::pending() for gas estimation.
+    /// For chains with sub-200ms block production (e.g., Base Flashblocks).
+    flashblocks: bool,
 }
 
 impl EvmProvider {
@@ -240,6 +243,7 @@ impl EvmProvider {
         eip1559: bool,
         network: Network,
         token_manager: Arc<TokenManager>,
+        flashblocks: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let chain = EvmChain::try_from(network)?;
         let signer_addresses: Vec<Address> =
@@ -368,6 +372,7 @@ impl EvmProvider {
             nonce_manager,
             eip712_version_cache: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             token_manager,
+            flashblocks,
         })
     }
 
@@ -563,28 +568,39 @@ impl MetaEvmProvider for EvmProvider {
             "Using receipt timeout for transaction"
         );
 
-        // Apply gas buffer if configured
+        // Apply gas buffer if configured.
+        // When flashblocks is enabled, always do explicit gas estimation with BlockId::latest()
+        // because Alloy's GasFiller uses BlockId::pending() which is unreliable on chains
+        // with sub-200ms block production (e.g., Base Flashblocks).
         let gas_buffer = config
             .as_ref()
             .map(|c| c.transaction.gas_buffer_for_network(&network_str))
             .unwrap_or(1.0);
 
-        if gas_buffer > 1.0 {
+        if gas_buffer > 1.0 || self.flashblocks {
+            let block_id = if self.flashblocks {
+                BlockId::latest()
+            } else {
+                BlockId::pending()
+            };
             let estimated_gas = self
                 .inner
                 .estimate_gas(txr.clone())
+                .block(block_id)
                 .await
                 .map_err(|e| {
                     FacilitatorLocalError::ContractCall(format!("Gas estimation failed: {e:?}"))
                 })?;
 
-            let buffered_gas = (estimated_gas as f64 * gas_buffer) as u64;
+            let effective_buffer = if gas_buffer > 1.0 { gas_buffer } else { 1.0 };
+            let buffered_gas = (estimated_gas as f64 * effective_buffer) as u64;
             tracing::debug!(
                 estimated_gas,
-                gas_buffer,
+                gas_buffer = effective_buffer,
                 buffered_gas,
+                flashblocks = self.flashblocks,
                 network = %network_str,
-                "Applied gas buffer to transaction"
+                "Applied gas estimation to transaction"
             );
             txr = txr.with_gas_limit(buffered_gas);
         }
@@ -711,7 +727,13 @@ impl FromEnvByNetworkBuild for EvmProvider {
             )
         };
 
-        let provider = EvmProvider::try_new(wallet, &rpc_url, is_eip1559, network, token_manager).await?;
+        // Read flashblocks setting from chain config
+        let flashblocks = crate::config::FacilitatorConfig::from_env()
+            .ok()
+            .and_then(|c| c.transaction.chains.get(&network.to_string()).map(|cc| cc.flashblocks))
+            .unwrap_or(false);
+
+        let provider = EvmProvider::try_new(wallet, &rpc_url, is_eip1559, network, token_manager, flashblocks).await?;
         Ok(Some(provider))
     }
 }
