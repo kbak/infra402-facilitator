@@ -339,8 +339,13 @@ impl EvmProvider {
             })?;
 
         // Create RPC client with custom HTTP client
-        let client = RpcClient::builder()
+        let mut client = RpcClient::builder()
             .http_with_client(http_client, url);
+
+        // Flashblocks chains have sub-200ms blocks; override Alloy's 7s default poll interval
+        if flashblocks {
+            client = client.with_poll_interval(std::time::Duration::from_millis(200));
+        }
 
         // Create nonce manager explicitly so we can store a reference for error handling
         let nonce_manager = PendingNonceManager::default();
@@ -445,6 +450,8 @@ pub trait MetaEvmProvider {
     fn eip712_cache(&self) -> &Arc<tokio::sync::RwLock<std::collections::HashMap<Address, (String, std::time::Instant)>>>;
     /// Returns reference to token manager for dynamic contract selection.
     fn token_manager(&self) -> &TokenManager;
+    /// Whether this provider targets a flashblocks chain (sub-200ms blocks).
+    fn flashblocks(&self) -> bool;
 
     /// Sends a meta-transaction to the network.
     fn send_transaction(
@@ -484,6 +491,10 @@ impl MetaEvmProvider for EvmProvider {
 
     fn token_manager(&self) -> &TokenManager {
         &self.token_manager
+    }
+
+    fn flashblocks(&self) -> bool {
+        self.flashblocks
     }
 
     /// Send a meta-transaction with provided `to`, `calldata`, and automatically selected signer.
@@ -763,7 +774,7 @@ where
 
         // Perform payment validation WITHOUT balance check (we'll batch it with signature validation)
         let (contract, payment, eip712_domain) =
-            assert_valid_payment(self.inner(), self.chain(), payload, requirements, Some(self.eip712_cache()), true, self.token_manager()).await?;
+            assert_valid_payment(self.inner(), self.chain(), payload, requirements, Some(self.eip712_cache()), true, self.token_manager(), self.flashblocks()).await?;
 
         let signed_message = SignedMessage::extract(&payment, &eip712_domain)?;
         let payer = signed_message.address;
@@ -826,6 +837,7 @@ where
                                         token_contract = %transfer_call.contract_address,
                                         otel.kind = "client",
                                 )),
+                            self.flashblocks(),
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "batched verification multicall"))?;
@@ -887,6 +899,7 @@ where
                                         token_contract = %transfer_call.contract_address,
                                         otel.kind = "client",
                                 )),
+                            self.flashblocks(),
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "batched verification multicall"))?;
@@ -939,6 +952,7 @@ where
                                         token_contract = %transfer_call.contract_address,
                                         otel.kind = "client",
                                 )),
+                            self.flashblocks(),
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "batched verification multicall"))?;
@@ -1014,6 +1028,7 @@ where
                                         token_contract = %transfer_call.contract_address,
                                         otel.kind = "client",
                                 )),
+                            self.flashblocks(),
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "batched verification multicall"))?;
@@ -1066,6 +1081,7 @@ where
                                         token_contract = %transfer_call.contract_address,
                                         otel.kind = "client",
                                 )),
+                            self.flashblocks(),
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "batched verification multicall"))?;
@@ -1116,6 +1132,7 @@ where
                                         token_contract = %transfer_call.contract_address,
                                         otel.kind = "client",
                                 )),
+                            self.flashblocks(),
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "batched verification multicall"))?;
@@ -1164,7 +1181,7 @@ where
         let payload = &request.payment_payload;
         let requirements = &request.payment_requirements;
         let (contract, payment, eip712_domain) =
-            assert_valid_payment(self.inner(), self.chain(), payload, requirements, Some(self.eip712_cache()), false, self.token_manager()).await?;
+            assert_valid_payment(self.inner(), self.chain(), payload, requirements, Some(self.eip712_cache()), false, self.token_manager(), self.flashblocks()).await?;
 
         let signed_message = SignedMessage::extract(&payment, &eip712_domain)?;
         let payer = signed_message.address;
@@ -1400,7 +1417,7 @@ impl EvmProvider {
 
         // Validate payment and extract contract, payment data, and EIP-712 domain
         let (contract, payment, eip712_domain) =
-            assert_valid_payment(self.inner(), self.chain(), payload, requirements, Some(self.eip712_cache()), false, &self.token_manager).await?;
+            assert_valid_payment(self.inner(), self.chain(), payload, requirements, Some(self.eip712_cache()), false, &self.token_manager, self.flashblocks).await?;
 
         let signed_message = SignedMessage::extract(&payment, &eip712_domain)?;
         let payer = signed_message.address;
@@ -1898,17 +1915,26 @@ fn is_unsupported_pending_error<E: std::fmt::Debug>(error: &E) -> bool {
     has_error
 }
 
-/// Helper function to call a contract method with automatic fallback to "latest" block tag
+/// Call a contract method with automatic fallback to "latest" block tag
 /// if the RPC doesn't support "pending".
 ///
-/// Takes async blocks that produce the call results.
+/// When `flashblocks` is true, skips the `try_call` (which uses the default "pending" block
+/// tag) and goes directly to `retry_call` (which uses "latest"). On chains with sub-200ms
+/// block production (e.g., Base Flashblocks) the "pending" state is unreliable and can cause
+/// simulations to revert with stale/inconsistent state.
 async fn call_with_fallback<T, E>(
     try_call: impl std::future::Future<Output = Result<T, E>>,
     retry_call: impl std::future::Future<Output = Result<T, E>>,
+    flashblocks: bool,
 ) -> Result<T, E>
 where
     E: std::fmt::Debug,
 {
+    if flashblocks {
+        tracing::trace!("Flashblocks enabled, using latest block directly for contract call");
+        return retry_call.await;
+    }
+
     match try_call.await {
         Ok(result) => {
             tracing::trace!("Contract call succeeded on first attempt");
@@ -1978,6 +2004,7 @@ async fn assert_enough_balance<P: Provider>(
     token_contract: &Erc3009Contract<P>,
     sender: &EvmAddress,
     max_amount_required: U256,
+    flashblocks: bool,
 ) -> Result<(), FacilitatorLocalError> {
     let balance = match token_contract {
         Erc3009Contract::PackedBytes(packed_abi) => match packed_abi {
@@ -2004,6 +2031,7 @@ async fn assert_enough_balance<P: Provider>(
                             sender = %sender,
                             otel.kind = "client"
                         )),
+                    flashblocks,
                 )
                 .await
                 .map_err(|e| categorize_transport_error(e, "balance query"))?
@@ -2033,6 +2061,7 @@ async fn assert_enough_balance<P: Provider>(
                             sender = %sender,
                             otel.kind = "client"
                         )),
+                    flashblocks,
                 )
                 .await
                 .map_err(|e| categorize_transport_error(e, "balance query"))?
@@ -2060,6 +2089,7 @@ async fn assert_enough_balance<P: Provider>(
                             sender = %sender,
                             otel.kind = "client"
                         )),
+                    flashblocks,
                 )
                 .await
                 .map_err(|e| categorize_transport_error(e, "balance query"))?
@@ -2152,6 +2182,7 @@ async fn assert_domain<P: Provider>(
     asset_address: &Address,
     requirements: &PaymentRequirements,
     version_cache: Option<&Arc<tokio::sync::RwLock<std::collections::HashMap<Address, (String, std::time::Instant)>>>>,
+    flashblocks: bool,
 ) -> Result<Eip712Domain, FacilitatorLocalError> {
     let usdc = USDCDeployment::by_network(payload.network);
     let name = requirements
@@ -2211,6 +2242,7 @@ async fn assert_domain<P: Provider>(
                                         "fetch_eip712_version",
                                         otel.kind = "client",
                                     )),
+                                flashblocks,
                             )
                             .await
                             .map_err(|e| categorize_transport_error(e, "fetch EIP-712 version"))?
@@ -2236,6 +2268,7 @@ async fn assert_domain<P: Provider>(
                                         "fetch_eip712_domain",
                                         otel.kind = "client",
                                     )),
+                                flashblocks,
                             )
                             .await
                             .map_err(|e| categorize_transport_error(e, "fetch EIP-712 domain"))?;
@@ -2260,6 +2293,7 @@ async fn assert_domain<P: Provider>(
                                         "fetch_eip712_domain",
                                         otel.kind = "client",
                                     )),
+                                flashblocks,
                             )
                             .await
                             .map_err(|e| categorize_transport_error(e, "fetch EIP-712 domain"))?;
@@ -2295,6 +2329,7 @@ async fn assert_domain<P: Provider>(
                                     "fetch_eip712_version",
                                     otel.kind = "client",
                                 )),
+                            flashblocks,
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "fetch EIP-712 version"))?
@@ -2320,6 +2355,7 @@ async fn assert_domain<P: Provider>(
                                     "fetch_eip712_domain",
                                     otel.kind = "client",
                                 )),
+                            flashblocks,
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "fetch EIP-712 domain"))?;
@@ -2344,6 +2380,7 @@ async fn assert_domain<P: Provider>(
                                     "fetch_eip712_domain",
                                     otel.kind = "client",
                                 )),
+                            flashblocks,
                         )
                         .await
                         .map_err(|e| categorize_transport_error(e, "fetch EIP-712 domain"))?;
@@ -2431,6 +2468,7 @@ async fn assert_valid_payment<P: Provider + Clone>(
     version_cache: Option<&Arc<tokio::sync::RwLock<std::collections::HashMap<Address, (String, std::time::Instant)>>>>,
     skip_balance_check: bool,
     token_manager: &TokenManager,
+    flashblocks: bool,
 ) -> Result<(Erc3009Contract<P>, ExactEvmPayment, Eip712Domain), FacilitatorLocalError> {
     let payment_payload = match &payload.payload {
         ExactPaymentPayload::Evm(payload) => payload,
@@ -2519,7 +2557,7 @@ async fn assert_valid_payment<P: Provider + Clone>(
         create_erc3009_contract(crate::tokens::SignatureFormat::PackedBytes, "abi/USDC.json", asset_address, provider.clone())
     };
 
-    let domain = assert_domain(chain, &contract, payload, &asset_address, requirements, version_cache).await?;
+    let domain = assert_domain(chain, &contract, payload, &asset_address, requirements, version_cache, flashblocks).await?;
 
     let amount_required = requirements.max_amount_required.0;
     if !skip_balance_check {
@@ -2527,6 +2565,7 @@ async fn assert_valid_payment<P: Provider + Clone>(
             &contract,
             &payment_payload.authorization.from,
             amount_required,
+            flashblocks,
         )
         .await?;
     }
