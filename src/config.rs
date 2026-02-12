@@ -202,6 +202,12 @@ pub struct ChainConfig {
     /// where the "pending" block state is unreliable.
     #[serde(default)]
     pub flashblocks: bool,
+
+    /// Override the receipt poll interval in milliseconds.
+    /// Alloy's default is 7000ms. Flashblocks chains should use 100-200ms.
+    /// If not set, uses 200ms when flashblocks=true, otherwise Alloy's default.
+    #[serde(default)]
+    pub poll_interval_ms: Option<u64>,
 }
 
 impl ChainConfig {

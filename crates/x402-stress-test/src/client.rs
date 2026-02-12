@@ -97,10 +97,16 @@ impl FacilitatorClient {
             anyhow::bail!("Settle request failed with status {}: {}", status, body);
         }
 
-        let settle_response: SettleResponse = response
-            .json()
+        let body = response
+            .text()
             .await
-            .context("Failed to parse settle response")?;
+            .context("Failed to read settle response body")?;
+
+        let settle_response: SettleResponse = serde_json::from_str(&body)
+            .with_context(|| {
+                let truncated = if body.len() > 200 { &body[..200] } else { &body };
+                format!("Failed to parse settle response: {}", truncated)
+            })?;
 
         Ok(settle_response)
     }
@@ -175,10 +181,16 @@ impl FacilitatorClient {
             anyhow::bail!("Settle request failed with status {}: {}", status, body);
         }
 
-        let settle_response: SettleResponse = response
-            .json()
+        let body = response
+            .text()
             .await
-            .context("Failed to parse settle response")?;
+            .context("Failed to read settle response body")?;
+
+        let settle_response: SettleResponse = serde_json::from_str(&body)
+            .with_context(|| {
+                let truncated = if body.len() > 200 { &body[..200] } else { &body };
+                format!("Failed to parse settle response: {}", truncated)
+            })?;
 
         Ok(settle_response)
     }

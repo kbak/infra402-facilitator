@@ -27,7 +27,8 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller, WalletFiller,
 };
 use alloy::providers::{
-    Identity, MULTICALL3_ADDRESS, MulticallItem, Provider, RootProvider, WalletProvider,
+    Identity, MULTICALL3_ADDRESS, MulticallItem, PendingTransactionBuilder, Provider, RootProvider,
+    WalletProvider,
 };
 use alloy::rpc::client::RpcClient;
 use alloy::rpc::types::{BlockId, BlockNumberOrTag, TransactionReceipt, TransactionRequest};
@@ -342,9 +343,16 @@ impl EvmProvider {
         let mut client = RpcClient::builder()
             .http_with_client(http_client, url);
 
-        // Flashblocks chains have sub-200ms blocks; override Alloy's 7s default poll interval
-        if flashblocks {
-            client = client.with_poll_interval(std::time::Duration::from_millis(200));
+        // Override Alloy's 7s default poll interval if configured or flashblocks is enabled
+        let poll_interval_ms = config
+            .as_ref()
+            .and_then(|c| c.transaction.chains.get(&network_str))
+            .and_then(|chain_config| chain_config.poll_interval_ms)
+            .or(if flashblocks { Some(200) } else { None });
+
+        if let Some(poll_ms) = poll_interval_ms {
+            tracing::info!(poll_interval_ms = poll_ms, "Overriding receipt poll interval");
+            client = client.with_poll_interval(std::time::Duration::from_millis(poll_ms));
         }
 
         // Create nonce manager explicitly so we can store a reference for error handling
@@ -433,6 +441,195 @@ impl EvmProvider {
         // Use task-local storage to pass the address to send_transaction()
         PRESELECTED_FACILITATOR.scope(facilitator_address, Facilitator::settle(self, request)).await
     }
+
+    /// Submit a transaction without waiting for receipt confirmation.
+    ///
+    /// This is the first phase of nonce pipelining: gas estimation + tx submission.
+    /// The settlement lock should be released after this returns, before calling `await_receipt`.
+    pub async fn submit_transaction(
+        &self,
+        tx: MetaTransaction,
+    ) -> Result<SubmittedTransaction, FacilitatorLocalError> {
+        // Use pre-selected address if provided, otherwise check task-local, otherwise use round-robin
+        let from_address = tx.from.or_else(|| {
+            PRESELECTED_FACILITATOR.try_with(|addr| *addr).ok()
+        }).unwrap_or_else(|| self.next_signer_address());
+
+        let mut txr = TransactionRequest::default()
+            .with_to(tx.to)
+            .with_from(from_address)
+            .with_input(tx.calldata.clone());
+        if !self.eip1559 {
+            let provider = &self.inner;
+            let gas: u128 = provider
+                .get_gas_price()
+                .instrument(tracing::info_span!("get_gas_price"))
+                .await
+                .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
+            txr.set_gas_price(gas);
+        }
+
+        // Read receipt timeout from chain-specific config
+        let config = crate::config::FacilitatorConfig::from_env().ok();
+        let network_str = self.chain.network.to_string();
+        let receipt_timeout = config
+            .as_ref()
+            .and_then(|c| c.transaction.chains.get(&network_str))
+            .map(|chain_config| chain_config.receipt_timeout())
+            .or_else(|| {
+                std::env::var("TX_RECEIPT_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .map(Duration::from_secs)
+            })
+            .unwrap_or(Duration::from_secs(120));
+
+        // Gas estimation
+        let gas_buffer = config
+            .as_ref()
+            .map(|c| c.transaction.gas_buffer_for_network(&network_str))
+            .unwrap_or(1.0);
+
+        if gas_buffer > 1.0 || self.flashblocks {
+            let block_id = if self.flashblocks {
+                BlockId::latest()
+            } else {
+                BlockId::pending()
+            };
+            let gas_start = std::time::Instant::now();
+            let estimated_gas = self
+                .inner
+                .estimate_gas(txr.clone())
+                .block(block_id)
+                .await
+                .map_err(|e| {
+                    FacilitatorLocalError::ContractCall(format!("Gas estimation failed: {e:?}"))
+                })?;
+            let gas_elapsed = gas_start.elapsed();
+
+            let effective_buffer = if gas_buffer > 1.0 { gas_buffer } else { 1.0 };
+            let buffered_gas = (estimated_gas as f64 * effective_buffer) as u64;
+            tracing::info!(
+                estimated_gas,
+                gas_buffer = effective_buffer,
+                buffered_gas,
+                flashblocks = self.flashblocks,
+                network = %network_str,
+                gas_estimate_ms = gas_elapsed.as_millis() as u64,
+                "Gas estimation completed"
+            );
+            txr = txr.with_gas_limit(buffered_gas);
+        }
+
+        // Send transaction with nonce retry logic
+        const MAX_NONCE_RETRIES: u32 = 1;
+        let mut nonce_retry_count = 0;
+        let send_start = std::time::Instant::now();
+
+        let pending_tx = loop {
+            match self.inner.send_transaction(txr.clone()).await {
+                Ok(pending) => break pending,
+                Err(e) => {
+                    let error_str = format!("{e:?}");
+                    let is_nonce_error = error_str.contains("nonce too low")
+                        || error_str.contains("nonce too high");
+
+                    if is_nonce_error && nonce_retry_count < MAX_NONCE_RETRIES {
+                        if let Some(expected_nonce) =
+                            parse_expected_nonce_from_error(&error_str)
+                        {
+                            tracing::warn!(
+                                from = %from_address,
+                                expected_nonce,
+                                error = %error_str,
+                                "nonce mismatch detected - correcting and retrying"
+                            );
+                            self.nonce_manager
+                                .set_nonce(from_address, expected_nonce.saturating_sub(1))
+                                .await;
+                            nonce_retry_count += 1;
+                            continue;
+                        }
+                    }
+
+                    if is_nonce_error {
+                        tracing::error!(
+                            from = %from_address,
+                            error = %error_str,
+                            "nonce mismatch not recoverable after retry"
+                        );
+                    } else if error_str.contains("replacement transaction underpriced") {
+                        tracing::warn!(
+                            from = %from_address,
+                            error = %error_str,
+                            "transaction replacement attempted with insufficient gas price"
+                        );
+                    }
+
+                    self.nonce_manager.reset_nonce(from_address).await;
+                    return Err(FacilitatorLocalError::ContractCall(error_str));
+                }
+            }
+        };
+        let send_elapsed = send_start.elapsed();
+        tracing::info!(
+            from = %from_address,
+            network = %network_str,
+            send_tx_ms = send_elapsed.as_millis() as u64,
+            "Transaction submitted"
+        );
+
+        Ok(SubmittedTransaction {
+            pending_tx,
+            from_address,
+            send_elapsed,
+            receipt_timeout,
+            confirmations: tx.confirmations,
+            network_str,
+        })
+    }
+
+    /// Wait for a previously submitted transaction to be confirmed.
+    ///
+    /// This is the second phase of nonce pipelining. The settlement lock should
+    /// already be released before calling this.
+    pub async fn await_receipt(
+        &self,
+        submitted: SubmittedTransaction,
+    ) -> Result<TransactionReceipt, FacilitatorLocalError> {
+        let receipt_start = std::time::Instant::now();
+        let watcher = submitted.pending_tx
+            .with_required_confirmations(submitted.confirmations)
+            .with_timeout(Some(submitted.receipt_timeout));
+
+        match watcher.get_receipt().await {
+            Ok(receipt) => {
+                let receipt_elapsed = receipt_start.elapsed();
+                tracing::info!(
+                    from = %submitted.from_address,
+                    network = %submitted.network_str,
+                    send_tx_ms = submitted.send_elapsed.as_millis() as u64,
+                    receipt_wait_ms = receipt_elapsed.as_millis() as u64,
+                    total_ms = (submitted.send_elapsed + receipt_elapsed).as_millis() as u64,
+                    "Transaction confirmed"
+                );
+                Ok(receipt)
+            }
+            Err(e) => {
+                let receipt_elapsed = receipt_start.elapsed();
+                tracing::warn!(
+                    from = %submitted.from_address,
+                    network = %submitted.network_str,
+                    send_tx_ms = submitted.send_elapsed.as_millis() as u64,
+                    receipt_wait_ms = receipt_elapsed.as_millis() as u64,
+                    error = %e,
+                    "Receipt fetch failed"
+                );
+                self.nonce_manager.reset_nonce(submitted.from_address).await;
+                Err(FacilitatorLocalError::ContractCall(format!("{e:?}")))
+            }
+        }
+    }
 }
 
 /// Trait for sending meta-transactions with custom target and calldata.
@@ -473,6 +670,35 @@ pub struct MetaTransaction {
     pub from: Option<Address>,
 }
 
+/// A transaction that has been submitted to the network but not yet confirmed.
+/// Used for nonce pipelining: the settlement lock can be released after submission,
+/// allowing the next batch to start while this one waits for confirmation.
+pub struct SubmittedTransaction {
+    /// The pending transaction handle for waiting on receipt.
+    pub pending_tx: PendingTransactionBuilder<AlloyEthereum>,
+    /// The sender address.
+    pub from_address: Address,
+    /// Time elapsed during transaction submission (for telemetry).
+    pub send_elapsed: Duration,
+    /// Timeout for waiting on receipt.
+    pub receipt_timeout: Duration,
+    /// Required number of confirmations.
+    pub confirmations: u64,
+    /// Network name (for logging).
+    pub network_str: String,
+}
+
+/// A batch of settlements that has been submitted but not yet confirmed.
+/// The settlement lock can be released after creating this, before waiting for the receipt.
+pub struct PendingBatch {
+    /// The submitted transaction awaiting confirmation.
+    pub submitted: SubmittedTransaction,
+    /// The original settlements for response construction.
+    pub settlements: Vec<ValidatedSettlement>,
+    /// Indices of deployment calls within the Multicall3 calls.
+    pub deployment_indices: Vec<usize>,
+}
+
 impl MetaEvmProvider for EvmProvider {
     type Error = FacilitatorLocalError;
     type Inner = InnerProvider;
@@ -497,193 +723,17 @@ impl MetaEvmProvider for EvmProvider {
         self.flashblocks
     }
 
-    /// Send a meta-transaction with provided `to`, `calldata`, and automatically selected signer.
+    /// Send a meta-transaction: submit + wait for receipt.
     ///
-    /// This method constructs a transaction from the provided [`MetaTransaction`], automatically
-    /// selects the next available signer using round-robin selection, and handles gas pricing
-    /// based on whether the network supports EIP-1559.
-    ///
-    /// If the transaction fails at any point (during submission or receipt fetching), the nonce
-    /// for the sending address is reset to force a fresh query on the next transaction. This
-    /// ensures correctness even when transactions partially succeed (e.g., submitted but receipt
-    /// fetch times out).
-    ///
-    /// # Gas Pricing Strategy
-    ///
-    /// - **EIP-1559 networks**: Uses automatic gas pricing via the provider's fillers.
-    /// - **Legacy networks**: Fetches the current gas price using `get_gas_price()` and sets it explicitly.
-    ///
-    /// # Timeout Configuration
-    ///
-    /// Receipt fetching is subject to a configurable timeout:
-    /// - Default: 30 seconds
-    /// - Override via `TX_RECEIPT_TIMEOUT_SECS` environment variable
-    /// - If the timeout expires, the nonce is reset and an error is returned
-    ///
-    /// # Parameters
-    ///
-    /// - `tx`: A [`MetaTransaction`] containing the target address and calldata.
-    ///
-    /// # Returns
-    ///
-    /// A [`TransactionReceipt`] once the transaction has been mined and confirmed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FacilitatorLocalError::ContractCall`] if:
-    /// - Gas price fetching fails (on legacy networks)
-    /// - Transaction sending fails
-    /// - Receipt retrieval fails or times out
+    /// Delegates to `submit_transaction` + `await_receipt`. For nonce pipelining
+    /// (releasing the settlement lock between send and receipt wait), call those
+    /// methods separately instead.
     async fn send_transaction(
         &self,
         tx: MetaTransaction,
     ) -> Result<TransactionReceipt, Self::Error> {
-        // Use pre-selected address if provided, otherwise check task-local, otherwise use round-robin
-        let from_address = tx.from.or_else(|| {
-            PRESELECTED_FACILITATOR.try_with(|addr| *addr).ok()
-        }).unwrap_or_else(|| self.next_signer_address());
-
-        let mut txr = TransactionRequest::default()
-            .with_to(tx.to)
-            .with_from(from_address)
-            .with_input(tx.calldata);
-        if !self.eip1559 {
-            let provider = &self.inner;
-            let gas: u128 = provider
-                .get_gas_price()
-                .instrument(tracing::info_span!("get_gas_price"))
-                .await
-                .map_err(|e| FacilitatorLocalError::ContractCall(format!("{e:?}")))?;
-            txr.set_gas_price(gas);
-        }
-
-        // Read receipt timeout from chain-specific config, fall back to env var, or use default of 120 seconds
-        let config = crate::config::FacilitatorConfig::from_env().ok();
-        let network_str = self.chain.network.to_string();
-        let receipt_timeout = config
-            .as_ref()
-            .and_then(|c| c.transaction.chains.get(&network_str))
-            .map(|chain_config| chain_config.receipt_timeout())
-            .or_else(|| {
-                // Fallback to env var for backwards compatibility with upstream examples
-                std::env::var("TX_RECEIPT_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-                    .map(Duration::from_secs)
-            })
-            .unwrap_or(Duration::from_secs(120));
-
-        tracing::debug!(
-            network=%self.chain.network,
-            receipt_timeout_secs=receipt_timeout.as_secs(),
-            "Using receipt timeout for transaction"
-        );
-
-        // Apply gas buffer if configured.
-        // When flashblocks is enabled, always do explicit gas estimation with BlockId::latest()
-        // because Alloy's GasFiller uses BlockId::pending() which is unreliable on chains
-        // with sub-200ms block production (e.g., Base Flashblocks).
-        let gas_buffer = config
-            .as_ref()
-            .map(|c| c.transaction.gas_buffer_for_network(&network_str))
-            .unwrap_or(1.0);
-
-        if gas_buffer > 1.0 || self.flashblocks {
-            let block_id = if self.flashblocks {
-                BlockId::latest()
-            } else {
-                BlockId::pending()
-            };
-            let estimated_gas = self
-                .inner
-                .estimate_gas(txr.clone())
-                .block(block_id)
-                .await
-                .map_err(|e| {
-                    FacilitatorLocalError::ContractCall(format!("Gas estimation failed: {e:?}"))
-                })?;
-
-            let effective_buffer = if gas_buffer > 1.0 { gas_buffer } else { 1.0 };
-            let buffered_gas = (estimated_gas as f64 * effective_buffer) as u64;
-            tracing::debug!(
-                estimated_gas,
-                gas_buffer = effective_buffer,
-                buffered_gas,
-                flashblocks = self.flashblocks,
-                network = %network_str,
-                "Applied gas estimation to transaction"
-            );
-            txr = txr.with_gas_limit(buffered_gas);
-        }
-
-        // Send transaction with error handling and nonce retry logic
-        const MAX_NONCE_RETRIES: u32 = 1;
-        let mut nonce_retry_count = 0;
-
-        let pending_tx = loop {
-            match self.inner.send_transaction(txr.clone()).await {
-                Ok(pending) => break pending,
-                Err(e) => {
-                    let error_str = format!("{e:?}");
-
-                    // Handle nonce mismatch - parse expected nonce and retry
-                    let is_nonce_error = error_str.contains("nonce too low")
-                        || error_str.contains("nonce too high");
-
-                    if is_nonce_error && nonce_retry_count < MAX_NONCE_RETRIES {
-                        if let Some(expected_nonce) =
-                            parse_expected_nonce_from_error(&error_str)
-                        {
-                            tracing::warn!(
-                                from = %from_address,
-                                expected_nonce,
-                                error = %error_str,
-                                "nonce mismatch detected - correcting and retrying"
-                            );
-                            // Set to expected_nonce - 1 so next get_next_nonce() returns expected_nonce
-                            self.nonce_manager
-                                .set_nonce(from_address, expected_nonce.saturating_sub(1))
-                                .await;
-                            nonce_retry_count += 1;
-                            continue;
-                        }
-                    }
-
-                    // Log appropriate error/warning for unrecoverable errors
-                    if is_nonce_error {
-                        tracing::error!(
-                            from = %from_address,
-                            error = %error_str,
-                            "nonce mismatch not recoverable after retry"
-                        );
-                    } else if error_str.contains("replacement transaction underpriced") {
-                        tracing::warn!(
-                            from = %from_address,
-                            error = %error_str,
-                            "transaction replacement attempted with insufficient gas price"
-                        );
-                    }
-
-                    // Transaction submission failed - reset nonce to force requery
-                    self.nonce_manager.reset_nonce(from_address).await;
-                    return Err(FacilitatorLocalError::ContractCall(error_str));
-                }
-            }
-        };
-
-        // Get receipt with timeout - use with_timeout for better error handling
-        let watcher = pending_tx
-            .with_required_confirmations(tx.confirmations)
-            .with_timeout(Some(receipt_timeout));
-
-        match watcher.get_receipt().await {
-            Ok(receipt) => Ok(receipt),
-            Err(e) => {
-                // Receipt fetch failed (timeout or other error) - reset nonce to force requery
-                self.nonce_manager.reset_nonce(from_address).await;
-                Err(FacilitatorLocalError::ContractCall(format!("{e:?}")))
-            }
-        }
+        let submitted = self.submit_transaction(tx).await?;
+        self.await_receipt(submitted).await
     }
 }
 
@@ -1693,6 +1743,127 @@ impl EvmProvider {
         // Build SettleResponse for each settlement
         let mut responses = Vec::with_capacity(settlements.len());
         for (settlement, result) in settlements.iter().zip(results.iter()) {
+            let response = if result.success {
+                SettleResponse {
+                    success: true,
+                    error_reason: None,
+                    payer: settlement.payer.clone(),
+                    transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
+                    network: settlement.network,
+                }
+            } else {
+                SettleResponse {
+                    success: false,
+                    error_reason: Some(FacilitatorErrorReason::FreeForm(
+                        "Transfer failed in batch".to_string(),
+                    )),
+                    payer: settlement.payer.clone(),
+                    transaction: Some(TransactionHash::Evm(receipt.transaction_hash.0)),
+                    network: settlement.network,
+                }
+            };
+            responses.push(response);
+        }
+
+        Ok(responses)
+    }
+
+    /// Submit a batch of settlements without waiting for receipt confirmation.
+    ///
+    /// This is the first phase of nonce pipelining for batches. The settlement lock
+    /// should be released after this returns, before calling `complete_batch`.
+    pub async fn send_batch(
+        &self,
+        settlements: Vec<ValidatedSettlement>,
+        allow_partial_failure: bool,
+    ) -> Result<PendingBatch, FacilitatorLocalError> {
+        if settlements.is_empty() {
+            return Err(FacilitatorLocalError::ContractCall(
+                "Cannot send empty batch".to_string(),
+            ));
+        }
+
+        // Build Multicall3 Call3 structs (same as settle_batch)
+        let mut calls = Vec::new();
+        let mut deployment_indices = Vec::new();
+
+        let has_hooks = settlements.iter().any(|s| !s.hooks.is_empty());
+        let hook_allow_failure = if has_hooks {
+            allow_partial_failure
+        } else {
+            allow_partial_failure
+        };
+
+        for settlement in settlements.iter() {
+            if let Some(deployment) = &settlement.deployment {
+                deployment_indices.push(calls.len());
+                calls.push(IMulticall3::Call3 {
+                    allowFailure: true,
+                    target: deployment.factory,
+                    callData: deployment.factory_calldata.clone(),
+                });
+            }
+
+            calls.push(IMulticall3::Call3 {
+                allowFailure: hook_allow_failure,
+                target: settlement.target,
+                callData: settlement.calldata.clone(),
+            });
+
+            for hook in &settlement.hooks {
+                calls.push(IMulticall3::Call3 {
+                    allowFailure: hook.allow_failure,
+                    target: hook.target,
+                    callData: hook.calldata.clone(),
+                });
+            }
+        }
+
+        // Submit Multicall3 transaction (gas estimation + send, no receipt wait)
+        let aggregate_call = IMulticall3::aggregate3Call { calls };
+        let submitted = self
+            .submit_transaction(MetaTransaction {
+                to: MULTICALL3_ADDRESS,
+                calldata: aggregate_call.abi_encode().into(),
+                confirmations: 1,
+                from: None,
+            })
+            .instrument(
+                tracing::info_span!("batch_send_multicall3",
+                    batch_size = settlements.len(),
+                    allow_partial_failure = allow_partial_failure,
+                    otel.kind = "client",
+                ),
+            )
+            .await?;
+
+        Ok(PendingBatch {
+            submitted,
+            settlements,
+            deployment_indices,
+        })
+    }
+
+    /// Wait for a submitted batch to be confirmed and parse the results.
+    ///
+    /// This is the second phase of nonce pipelining. The settlement lock should
+    /// already be released before calling this.
+    pub async fn complete_batch(
+        &self,
+        pending: PendingBatch,
+    ) -> Result<Vec<SettleResponse>, FacilitatorLocalError> {
+        let receipt = self.await_receipt(pending.submitted).await?;
+
+        // Parse results from Multicall3 aggregate3 return data
+        let results = self.parse_aggregate3_results(
+            &receipt,
+            &pending.deployment_indices,
+            &pending.settlements,
+        )?;
+
+        // Build SettleResponse for each settlement
+        let mut responses = Vec::with_capacity(pending.settlements.len());
+        for (settlement, result) in pending.settlements.iter().zip(results.iter()) {
             let response = if result.success {
                 SettleResponse {
                     success: true,

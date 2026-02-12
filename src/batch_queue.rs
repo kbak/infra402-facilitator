@@ -253,7 +253,7 @@ impl BatchQueue {
     /// Flush the current batch of pending requests.
     async fn flush_batch(
         &self,
-        network_provider: &crate::chain::NetworkProvider,
+        network_provider: &Arc<crate::chain::NetworkProvider>,
         allow_partial_failure: bool,
     ) -> Result<(), FacilitatorLocalError> {
         // Take up to max_batch_size requests from the queue
