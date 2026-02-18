@@ -1,0 +1,12 @@
+app = "x402-stress-test"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile.stress-test"
+
+[deploy]
+  strategy = "immediate"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = 256

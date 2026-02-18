@@ -17,7 +17,7 @@ x402-chain-eip155 = { path = "../chains/x402-chain-eip155", features = ["client"
 alloy = { version = "1.6", features = ["signers"] }
 
 # HTTP client
-reqwest = { version = "0.13", features = ["json"] }
+reqwest = { version = "0.13", features = ["json", "http2"] }
 
 # Async runtime
 tokio = { version = "1.49", features = ["full"] }

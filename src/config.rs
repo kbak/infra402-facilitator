@@ -208,6 +208,29 @@ pub struct ChainConfig {
     /// If not set, uses 200ms when flashblocks=true, otherwise Alloy's default.
     #[serde(default)]
     pub poll_interval_ms: Option<u64>,
+
+    /// Max retries for rate-limit/503 errors (RetryBackoffLayer).
+    /// Default: 3. Set 0 to disable retry layer entirely.
+    #[serde(default = "default_rpc_max_retries")]
+    pub rpc_max_retries: u32,
+
+    /// Initial retry backoff in milliseconds. Default: 500.
+    #[serde(default = "default_rpc_initial_backoff_ms")]
+    pub rpc_initial_backoff_ms: u64,
+
+    /// Compute units per second budget for retry backoff calculation.
+    /// Higher values = less aggressive backoff. Default: 300.
+    #[serde(default = "default_rpc_compute_units_per_second")]
+    pub rpc_compute_units_per_second: u64,
+
+    /// Consecutive transport failures before skipping a transport. Default: 3.
+    /// Set to 0 to disable circuit breaker (always try all transports).
+    #[serde(default = "default_rpc_circuit_breaker_threshold")]
+    pub rpc_circuit_breaker_threshold: u32,
+
+    /// Seconds to skip a failing transport before probing again. Default: 30.
+    #[serde(default = "default_rpc_circuit_breaker_cooldown_secs")]
+    pub rpc_circuit_breaker_cooldown_secs: u64,
 }
 
 impl ChainConfig {
@@ -258,6 +281,26 @@ pub struct TransactionConfig {
 
 fn default_gas_buffer() -> f64 {
     1.0
+}
+
+fn default_rpc_max_retries() -> u32 {
+    3
+}
+
+fn default_rpc_initial_backoff_ms() -> u64 {
+    500
+}
+
+fn default_rpc_compute_units_per_second() -> u64 {
+    300
+}
+
+fn default_rpc_circuit_breaker_threshold() -> u32 {
+    3
+}
+
+fn default_rpc_circuit_breaker_cooldown_secs() -> u64 {
+    30
 }
 
 impl Default for TransactionConfig {

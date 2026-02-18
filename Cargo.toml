@@ -90,6 +90,7 @@ once_cell = { version = "1.21.3" }
 regex = { version = "1.12.3" }
 url = { version = "2.5.8", features = ["serde"] }
 alloy = { version = "1.6.1", features = ["dyn-abi"] }
+alloy-json-rpc = { version = "1.6" }
 thiserror = { version = "2.0.18" }
 base64 = { version = "0.22.1" }
 rust_decimal = { version = "1.40.0" }

@@ -238,9 +238,12 @@ pub struct EvmProvider {
 
 impl EvmProvider {
     /// Build an [`EvmProvider`] from a pre-composed Alloy ethereum provider [`InnerProvider`].
+    ///
+    /// Supports multiple RPC URLs for ordered failover. With a single URL, behavior is
+    /// identical to the previous implementation (no middleware layers added).
     pub async fn try_new(
         wallet: EthereumWallet,
-        rpc_url: &str,
+        rpc_urls: Vec<url::Url>,
         eip1559: bool,
         network: Network,
         token_manager: Arc<TokenManager>,
@@ -258,10 +261,11 @@ impl EvmProvider {
         // Configure RPC client with custom HTTP timeouts to prevent indefinite hangs
         let config = crate::config::FacilitatorConfig::from_env().ok();
         let network_str = network.to_string();
-        let rpc_timeout = config
+        let chain_config = config
             .as_ref()
-            .and_then(|c| c.transaction.chains.get(&network_str))
-            .map(|chain_config| chain_config.rpc_timeout())
+            .and_then(|c| c.transaction.chains.get(&network_str));
+        let rpc_timeout = chain_config
+            .map(|cc| cc.rpc_timeout())
             .or_else(|| {
                 config
                     .as_ref()
@@ -272,26 +276,9 @@ impl EvmProvider {
         tracing::debug!(
             network=%network,
             rpc_timeout_secs=rpc_timeout.as_secs(),
+            url_count=rpc_urls.len(),
             "Configuring RPC client with timeout"
         );
-
-        // Parse RPC URL for HTTP client configuration
-        let url = rpc_url
-            .parse::<url::Url>()
-            .map_err(|e| {
-                let error_str = format!("{:?}", e);
-                if error_str.contains("failed to lookup address") {
-                    tracing::error!("DNS lookup failed for {rpc_url}: {e:?}");
-                    FacilitatorLocalError::RpcProviderError(
-                        format!("DNS resolution failed for {rpc_url}")
-                    )
-                } else {
-                    tracing::error!("Invalid RPC URL {rpc_url}: {e:?}");
-                    FacilitatorLocalError::RpcProviderError(
-                        format!("Invalid RPC URL: {rpc_url}")
-                    )
-                }
-            })?;
 
         // Get connection pool configuration from config or use defaults
         let connection_timeout_secs = config
@@ -314,40 +301,104 @@ impl EvmProvider {
             "Configuring HTTP connection pool"
         );
 
-        // Build custom HTTP client with configured timeouts
-        let http_client = alloy::transports::http::reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(connection_timeout_secs))
-            .timeout(rpc_timeout)
-            .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
-            .pool_max_idle_per_host(pool_max_idle)
-            .build()
-            .map_err(|e| {
-                let error_str = format!("{:?}", e);
-                if error_str.contains("Too many open files") || error_str.contains("EMFILE") {
-                    tracing::error!(
-                        "File descriptor limit reached (pool_max_idle_per_host={}): {e:?}",
-                        pool_max_idle
-                    );
-                    FacilitatorLocalError::ResourceExhaustion(
-                        "File descriptor limit reached".to_string()
-                    )
-                } else {
-                    tracing::error!("HTTP client build failed: {e:?}");
-                    FacilitatorLocalError::RpcProviderError(
-                        format!("HTTP client initialization failed: {e}")
-                    )
-                }
-            })?;
+        // Build one HTTP transport per URL, each with its own reqwest::Client for pool isolation
+        let mut transports = Vec::with_capacity(rpc_urls.len());
+        for url in &rpc_urls {
+            let http_client = alloy::transports::http::reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(connection_timeout_secs))
+                .timeout(rpc_timeout)
+                .pool_idle_timeout(Duration::from_secs(pool_idle_timeout_secs))
+                .pool_max_idle_per_host(pool_max_idle)
+                .build()
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("failed to build HTTP client for {url}: {e}").into()
+                })?;
+            transports.push(alloy::transports::http::Http::with_client(http_client, url.clone()));
+        }
 
-        // Create RPC client with custom HTTP client
-        let mut client = RpcClient::builder()
-            .http_with_client(http_client, url);
+        // For multi-URL: validate chainId per endpoint, keep only healthy+matching ones.
+        // For single URL: skip validation to preserve exact current startup behavior.
+        let valid_transports = if rpc_urls.len() == 1 {
+            transports
+        } else {
+            let expected_chain_id = chain.chain_id;
+            let mut valid = Vec::new();
+            for (i, (transport, url)) in transports.into_iter().zip(rpc_urls.iter()).enumerate() {
+                let probe_client = alloy::transports::http::reqwest::Client::builder()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .map_err(|e| -> Box<dyn std::error::Error> {
+                        format!("probe client build failed: {e}").into()
+                    })?;
+                let probe = alloy::transports::http::Http::with_client(probe_client, url.clone());
+                let probe_rpc = RpcClient::new(probe, false);
+                let probe_provider = alloy::providers::RootProvider::<
+                    alloy::network::Ethereum,
+                >::new(probe_rpc);
+
+                use alloy::providers::Provider;
+                match probe_provider.get_chain_id().await {
+                    Ok(id) if id == expected_chain_id => {
+                        valid.push(transport);
+                        tracing::info!(url=%url, chain_id=id, "RPC #{i} validated");
+                    }
+                    Ok(id) => {
+                        tracing::error!(
+                            url=%url, expected=expected_chain_id, got=id,
+                            "RPC #{i} chainId mismatch — excluded"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(url=%url, error=%e, "RPC #{i} unreachable — excluded");
+                    }
+                }
+            }
+            if valid.is_empty() {
+                return Err("no healthy RPC endpoint with matching chainId".into());
+            }
+            tracing::info!(
+                network=%network,
+                healthy=valid.len(),
+                total=rpc_urls.len(),
+                "RPC endpoints validated"
+            );
+            valid
+        };
+
+        // Build RpcClient: single URL = no layers (exact current behavior),
+        // multiple URLs = OrderedFallbackService + optional RetryBackoffLayer
+        let max_retries = chain_config.map(|cc| cc.rpc_max_retries).unwrap_or(3);
+        let initial_backoff = chain_config.map(|cc| cc.rpc_initial_backoff_ms).unwrap_or(500);
+        let cu_per_sec = chain_config.map(|cc| cc.rpc_compute_units_per_second).unwrap_or(300);
+        let cb_threshold = chain_config.map(|cc| cc.rpc_circuit_breaker_threshold).unwrap_or(3);
+        let cb_cooldown_secs = chain_config.map(|cc| cc.rpc_circuit_breaker_cooldown_secs).unwrap_or(30);
+
+        let mut client = if valid_transports.len() == 1 {
+            // Single URL: no middleware layers, identical to previous behavior
+            let transport = valid_transports.into_iter().next().unwrap();
+            RpcClient::new(transport, false)
+        } else {
+            // Multiple URLs: ordered fallback with optional retry
+            let fallback = crate::transport::OrderedFallbackService::new(
+                valid_transports,
+                cb_threshold,
+                Duration::from_secs(cb_cooldown_secs),
+            )?;
+
+            if max_retries > 0 {
+                use alloy::transports::layers::RetryBackoffLayer;
+                RpcClient::builder()
+                    .layer(RetryBackoffLayer::new(max_retries, initial_backoff, cu_per_sec))
+                    .transport(fallback, false)
+            } else {
+                RpcClient::builder()
+                    .transport(fallback, false)
+            }
+        };
 
         // Override Alloy's 7s default poll interval if configured or flashblocks is enabled
-        let poll_interval_ms = config
-            .as_ref()
-            .and_then(|c| c.transaction.chains.get(&network_str))
-            .and_then(|chain_config| chain_config.poll_interval_ms)
+        let poll_interval_ms = chain_config
+            .and_then(|cc| cc.poll_interval_ms)
             .or(if flashblocks { Some(200) } else { None });
 
         if let Some(poll_ms) = poll_interval_ms {
@@ -373,7 +424,8 @@ impl EvmProvider {
             .wallet(wallet)
             .connect_client(client);
 
-        tracing::info!(network=%network, rpc=rpc_url, signers=?signer_addresses, "Initialized provider");
+        let rpc_desc: Vec<_> = rpc_urls.iter().map(|u| u.as_str()).collect();
+        tracing::info!(network=%network, rpc=?rpc_desc, signers=?signer_addresses, "Initialized provider");
 
         Ok(Self {
             inner,
@@ -754,9 +806,8 @@ impl FromEnvByNetworkBuild for EvmProvider {
         network: Network,
         token_manager: Option<&Arc<TokenManager>>,
     ) -> Result<Option<Self>, Box<dyn std::error::Error>> {
-        let env_var = from_env::rpc_env_name_from_network(network);
-        let rpc_url = match std::env::var(env_var).ok() {
-            Some(rpc_url) => rpc_url,
+        let rpc_urls = match from_env::rpc_urls_from_env(network)? {
+            Some(urls) => urls,
             None => {
                 tracing::warn!(network=%network, "no RPC URL configured, skipping");
                 return Ok(None);
@@ -794,7 +845,7 @@ impl FromEnvByNetworkBuild for EvmProvider {
             .and_then(|c| c.transaction.chains.get(&network.to_string()).map(|cc| cc.flashblocks))
             .unwrap_or(false);
 
-        let provider = EvmProvider::try_new(wallet, &rpc_url, is_eip1559, network, token_manager, flashblocks).await?;
+        let provider = EvmProvider::try_new(wallet, rpc_urls, is_eip1559, network, token_manager, flashblocks).await?;
         Ok(Some(provider))
     }
 }

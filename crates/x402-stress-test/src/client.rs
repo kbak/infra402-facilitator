@@ -8,6 +8,7 @@ use infra402_facilitator::types::{
     VerifyResponse,
 };
 use reqwest::Client;
+use std::time::Duration;
 
 /// HTTP client for interacting with the facilitator's /verify and /settle endpoints
 #[derive(Clone)]
@@ -19,8 +20,18 @@ pub struct FacilitatorClient {
 
 impl FacilitatorClient {
     pub fn new(base_url: String, api_key: Option<String>) -> Self {
+        let client = Client::builder()
+            // Keep warm connections alive between bursts
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(32)
+            // Prevent stalled requests from blocking workers forever
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("failed to build HTTP client");
+
         Self {
-            client: Client::new(),
+            client,
             base_url,
             api_key,
         }

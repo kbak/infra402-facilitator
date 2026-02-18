@@ -34,6 +34,7 @@ pub mod sig_down;
 pub mod telemetry;
 pub mod timestamp;
 pub mod tokens;
+pub mod transport;
 pub mod types;
 
 // Hidden re-exports just for macro expansion.

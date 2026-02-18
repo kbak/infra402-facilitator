@@ -32,6 +32,35 @@ pub const ENV_RPC_CELO_ALFAJORES: &str = "RPC_URL_CELO_ALFAJORES";
 pub const ENV_RPC_APTOS: &str = "APTOS_RPC_URL";
 pub const ENV_RPC_APTOS_TESTNET: &str = "APTOS_TESTNET_RPC_URL";
 
+/// Parse RPC URLs from the environment variable for a network.
+///
+/// Returns `Ok(None)` if the env var is not set (skip network — preserves existing behavior).
+/// Returns `Err` if the env var is set but contains invalid URLs or is empty after parsing.
+/// Supports comma-separated URLs: `"https://primary,https://fallback"`
+pub fn rpc_urls_from_env(
+    network: Network,
+) -> Result<Option<Vec<url::Url>>, Box<dyn std::error::Error>> {
+    let env_name = rpc_env_name_from_network(network);
+    let raw = match std::env::var(env_name) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+    let urls: Vec<url::Url> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<url::Url>().map_err(|e| -> Box<dyn std::error::Error> {
+                format!("invalid URL '{s}' in {env_name}: {e}").into()
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if urls.is_empty() {
+        return Err(format!("{env_name} is set but contains no valid URLs").into());
+    }
+    Ok(Some(urls))
+}
+
 pub fn rpc_env_name_from_network(network: Network) -> &'static str {
     match network {
         Network::BaseSepolia => ENV_RPC_BASE_SEPOLIA,
