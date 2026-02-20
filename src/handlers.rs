@@ -577,72 +577,124 @@ fn convert_v2_to_v1_verify(v2_json: &serde_json::Value) -> Result<VerifyRequest,
     use crate::chain::ChainId;
     use crate::network::Network;
 
-    // Extract payment_payload
     let payment_payload = v2_json
         .get("paymentPayload")
         .ok_or("missing paymentPayload")?;
-
-    // Convert chainId to network if present
-    let network = if let Some(chain_id_str) = payment_payload.get("chainId").and_then(|v| v.as_str())
-    {
-        let chain_id: ChainId = chain_id_str.parse().map_err(|e| format!("invalid chainId: {e}"))?;
-        Network::try_from(&chain_id).map_err(|e| format!("unknown chainId: {e}"))?
-    } else if let Some(network_value) = payment_payload.get("network") {
-        serde_json::from_value(network_value.clone())
-            .map_err(|e| format!("invalid network: {e}"))?
-    } else {
-        return Err("missing chainId or network in paymentPayload".to_string());
-    };
-
-    // Build v1 payment payload
-    let mut v1_payload = payment_payload.clone();
-    v1_payload["x402Version"] = serde_json::json!(1);
-    v1_payload["network"] = serde_json::to_value(&network).map_err(|e| e.to_string())?;
-
-    // Extract payment_requirements
     let payment_requirements = v2_json
         .get("paymentRequirements")
         .ok_or("missing paymentRequirements")?;
 
-    // Convert chainId to network in requirements if present
-    let req_network =
-        if let Some(chain_id_str) = payment_requirements.get("chainId").and_then(|v| v.as_str()) {
-            let chain_id: ChainId = chain_id_str
-                .parse()
-                .map_err(|e| format!("invalid chainId in requirements: {e}"))?;
-            Network::try_from(&chain_id).map_err(|e| format!("unknown chainId in requirements: {e}"))?
-        } else if let Some(network_value) = payment_requirements.get("network") {
-            serde_json::from_value(network_value.clone())
-                .map_err(|e| format!("invalid network in requirements: {e}"))?
-        } else {
-            return Err("missing chainId or network in paymentRequirements".to_string());
-        };
-
-    // Build v1 requirements - handle resource object conversion
-    let mut v1_requirements = payment_requirements.clone();
-    v1_requirements["network"] = serde_json::to_value(&req_network).map_err(|e| e.to_string())?;
-
-    // If resource is an object (v2 ResourceInfo), extract the URL and other fields
-    if let Some(resource) = payment_requirements.get("resource") {
-        if resource.is_object() {
-            if let Some(url) = resource.get("url") {
-                v1_requirements["resource"] = url.clone();
-            }
-            // Extract description and mimeType from resource if at top level they're missing
-            if !v1_requirements.get("description").is_some_and(|v| v.is_string()) {
-                if let Some(desc) = resource.get("description") {
-                    v1_requirements["description"] = desc.clone();
-                }
-            }
-            if !v1_requirements.get("mimeType").is_some_and(|v| v.is_string()) {
-                if let Some(mime) = resource.get("mimeType") {
-                    v1_requirements["mimeType"] = mime.clone();
-                }
-            }
+    // Helper: resolve a network value (may be chain name like "base-sepolia" or CAIP-2 like "eip155:84532")
+    let resolve_network = |v: &serde_json::Value| -> Result<Network, String> {
+        if let Ok(n) = serde_json::from_value::<Network>(v.clone()) {
+            return Ok(n);
         }
+        if let Some(s) = v.as_str() {
+            let chain_id: ChainId = s.parse().map_err(|e| format!("invalid network '{s}': {e}"))?;
+            return Network::try_from(&chain_id).map_err(|e| format!("unknown network '{s}': {e}"));
+        }
+        Err("network is not a string".to_string())
+    };
+
+    // Helper: find network in a JSON object (checks chainId, network, accepted.network)
+    let find_network = |obj: &serde_json::Value, ctx: &str| -> Result<Network, String> {
+        if let Some(v) = obj.get("chainId").filter(|v| v.is_string()) {
+            let chain_id: ChainId = v.as_str().unwrap().parse().map_err(|e| format!("{ctx}: invalid chainId: {e}"))?;
+            return Network::try_from(&chain_id).map_err(|e| format!("{ctx}: unknown chainId: {e}"));
+        }
+        if let Some(v) = obj.get("network") {
+            return resolve_network(v).map_err(|e| format!("{ctx}: {e}"));
+        }
+        if let Some(v) = obj.get("accepted").and_then(|a| a.get("network")) {
+            return resolve_network(v).map_err(|e| format!("{ctx}.accepted: {e}"));
+        }
+        Err(format!("{ctx}: missing chainId or network"))
+    };
+
+    // Helper: find a string field, checking top-level then accepted sub-object
+    let find_str = |obj: &serde_json::Value, field: &str| -> Option<serde_json::Value> {
+        obj.get(field)
+            .filter(|v| v.is_string())
+            .or_else(|| obj.get("accepted").and_then(|a| a.get(field)).filter(|v| v.is_string()))
+            .cloned()
+    };
+
+    // Helper: find a value field, checking top-level then accepted sub-object
+    let find_val = |obj: &serde_json::Value, field: &str| -> Option<serde_json::Value> {
+        obj.get(field)
+            .or_else(|| obj.get("accepted").and_then(|a| a.get(field)))
+            .cloned()
+    };
+
+    // --- Build v1 paymentPayload ---
+    let pp_network = find_network(payment_payload, "paymentPayload")?;
+    let pp_scheme = find_str(payment_payload, "scheme")
+        .ok_or("paymentPayload: missing scheme")?;
+    let pp_payload = payment_payload.get("payload")
+        .ok_or("paymentPayload: missing payload")?;
+
+    let v1_payload = serde_json::json!({
+        "x402Version": 1,
+        "scheme": pp_scheme,
+        "network": serde_json::to_value(&pp_network).map_err(|e| e.to_string())?,
+        "payload": pp_payload,
+    });
+
+    // --- Build v1 paymentRequirements ---
+    let req_network = find_network(payment_requirements, "paymentRequirements")?;
+    let req_scheme = find_str(payment_requirements, "scheme")
+        .ok_or("paymentRequirements: missing scheme")?;
+
+    // resource: v2 puts resource in paymentPayload (not requirements). Check both.
+    let resource_obj = payment_requirements
+        .get("resource")
+        .or_else(|| payment_payload.get("resource"));
+    let resource_url = if let Some(res) = resource_obj {
+        if res.is_object() {
+            res.get("url").cloned().unwrap_or(serde_json::json!("https://unknown"))
+        } else {
+            res.clone()
+        }
+    } else {
+        serde_json::json!("https://unknown")
+    };
+
+    // description & mimeType: check requirements, then resource object (from either source)
+    let description = find_str(payment_requirements, "description")
+        .or_else(|| resource_obj.and_then(|r| r.get("description")).cloned())
+        .unwrap_or(serde_json::json!(""));
+    let mime_type = find_str(payment_requirements, "mimeType")
+        .or_else(|| resource_obj.and_then(|r| r.get("mimeType")).cloned())
+        .unwrap_or(serde_json::json!("application/json"));
+
+    // amount: v2 uses "amount", v1 uses "maxAmountRequired"
+    let amount = find_val(payment_requirements, "maxAmountRequired")
+        .or_else(|| find_val(payment_requirements, "amount"))
+        .ok_or("paymentRequirements: missing amount/maxAmountRequired")?;
+
+    let pay_to = find_val(payment_requirements, "payTo")
+        .ok_or("paymentRequirements: missing payTo")?;
+    let asset = find_val(payment_requirements, "asset")
+        .ok_or("paymentRequirements: missing asset")?;
+    let max_timeout = find_val(payment_requirements, "maxTimeoutSeconds")
+        .unwrap_or(serde_json::json!(300));
+    let extra = find_val(payment_requirements, "extra");
+
+    let mut v1_requirements = serde_json::json!({
+        "scheme": req_scheme,
+        "network": serde_json::to_value(&req_network).map_err(|e| e.to_string())?,
+        "maxAmountRequired": amount,
+        "resource": resource_url,
+        "description": description,
+        "mimeType": mime_type,
+        "payTo": pay_to,
+        "maxTimeoutSeconds": max_timeout,
+        "asset": asset,
+    });
+    if let Some(extra_val) = extra {
+        v1_requirements["extra"] = extra_val;
     }
 
-    // Build v1 request
     let v1_json = serde_json::json!({
         "x402Version": 1,
         "paymentPayload": v1_payload,
