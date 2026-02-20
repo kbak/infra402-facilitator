@@ -8,7 +8,8 @@ use solana_pubkey::pubkey;
 use std::env;
 use tracing::instrument;
 use x402_axum::X402Middleware;
-use x402_chain_eip155::{KnownNetworkEip155, V1Eip155Exact, V2Eip155Exact};
+use x402_chain_eip155::chain::{AssetTransferMethod, Eip155TokenDeployment};
+use x402_chain_eip155::{KnownNetworkEip155, V1Eip155Exact, V2Eip155Exact, V2Eip155Upto};
 use x402_chain_solana::{KnownNetworkSolana, V1SolanaExact, V2SolanaExact};
 use x402_types::networks::USDC;
 
@@ -16,6 +17,14 @@ use x402_types::networks::USDC;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenv().ok();
     init_tracing();
+
+    let usdc_base_sepolia = USDC::base_sepolia();
+    let usdc_base_sepolia_permit2 = Eip155TokenDeployment {
+        chain_reference: usdc_base_sepolia.chain_reference,
+        address: usdc_base_sepolia.address,
+        decimals: usdc_base_sepolia.decimals,
+        transfer_method: AssetTransferMethod::Permit2,
+    };
 
     let facilitator_url =
         env::var("FACILITATOR_URL").unwrap_or("https://facilitator.x402.rs".to_string());
@@ -49,6 +58,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     USDC::solana_devnet().amount(100),
                 )),
             ),
+        )
+        .route(
+            "/static-price-v2-permit2",
+            get(static_price_v2_permit2_handler).layer(x402.with_price_tag(
+                V2Eip155Exact::price_tag(
+                    address!("0xBAc675C310721717Cd4A37F6cbeA1F081b1C2a07"),
+                    usdc_base_sepolia_permit2.amount(10u64),
+                ),
+            )),
         )
         // Dynamic pricing: adjust price based on request parameters
         // GET /dynamic-price-v2 -> 100 units
@@ -109,6 +127,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             })),
+        )
+        // TODO CONTINUE Set price (and feature-based docs.rs)
+        .route(
+            "/eip155-upto",
+            get(eip155_upto_handler).layer(x402.with_price_tag(V2Eip155Upto::price_tag(
+                address!("0xBAc675C310721717Cd4A37F6cbeA1F081b1C2a07"),
+                usdc_base_sepolia_permit2.amount(10u64),
+            ))),
         );
 
     tracing::info!("Using facilitator on {}", x402.facilitator_url());
@@ -131,6 +157,16 @@ async fn my_handler() -> impl IntoResponse {
 #[instrument(skip_all)]
 async fn static_price_v2_handler() -> impl IntoResponse {
     (StatusCode::OK, "VIP content from /static-price-v2")
+}
+
+#[instrument(skip_all)]
+async fn static_price_v2_permit2_handler() -> impl IntoResponse {
+    (StatusCode::OK, "VIP content from /static-price-v2-permit2")
+}
+
+#[instrument(skip_all)]
+async fn eip155_upto_handler() -> impl IntoResponse {
+    (StatusCode::OK, "VIP content from /eip155-upto")
 }
 
 fn init_tracing() {

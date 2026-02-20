@@ -93,8 +93,8 @@ where
         payment_required
             .accepts
             .iter()
-            .filter_map(|v| {
-                let requirements: types::PaymentRequirements = v.as_concrete()?;
+            .filter_map(|original_json| {
+                let requirements = types::PaymentRequirements::try_from(original_json).ok()?;
                 let chain_id = ChainId::from_network_name(&requirements.network)?;
                 let chain_reference = Eip155ChainReference::try_from(chain_id.clone()).ok()?;
                 let candidate = PaymentCandidate {
@@ -171,7 +171,7 @@ pub async fn sign_erc3009_authorization<S: SignerLike + Sync>(
     let authorization = ExactEvmPayloadAuthorization {
         from: signer.address(),
         to: params.pay_to,
-        value: params.amount.into(),
+        value: params.amount,
         valid_after,
         valid_before,
         nonce,
@@ -184,7 +184,7 @@ pub async fn sign_erc3009_authorization<S: SignerLike + Sync>(
     let transfer_with_authorization = TransferWithAuthorization {
         from: authorization.from,
         to: authorization.to,
-        value: authorization.value.into(),
+        value: authorization.value,
         validAfter: U256::from(authorization.valid_after.as_secs()),
         validBefore: U256::from(authorization.valid_before.as_secs()),
         nonce: authorization.nonce,

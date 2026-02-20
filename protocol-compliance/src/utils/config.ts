@@ -72,6 +72,10 @@ export const FACILITATOR_CONFIG = {
       chains: "eip155:*",
     },
     {
+      id: "v2-eip155-upto",
+      chains: "eip155:*",
+    },
+    {
       id: "v1-solana-exact",
       chains: "solana:*",
     },
@@ -95,3 +99,6 @@ export async function makeFacilitatorConfig(): Promise<string> {
   await fs.writeFile(filename, JSON.stringify(FACILITATOR_CONFIG, null, 2));
   return filename;
 }
+
+export const TIMEOUT = 30000;
+export const TEST_CONFIG = { timeout: TIMEOUT } as const;

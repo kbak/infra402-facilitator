@@ -1,13 +1,17 @@
 import { x402Client, wrapFetchWithPayment } from "@x402/fetch";
-import { registerExactEvmScheme } from "@x402/evm/exact/client";
+import { ExactEvmScheme } from "@x402/evm/exact/client";
 import { privateKeyToAccount } from "viem/accounts";
 import { config } from "./config.js";
 import { spawn } from "child_process";
 import { WORKSPACE_ROOT } from "./workspace-root";
 import { printLines } from "./process-handle";
-import { registerExactSvmScheme } from "@x402/svm/exact/client";
+import { ExactSvmScheme } from "@x402/svm/exact/client";
 import { createKeyPairSignerFromBytes } from "@solana/kit";
 import { base58 } from "@scure/base";
+import { createPublicClient, createWalletClient, http } from "viem";
+import { baseSepoliaPreconf } from "viem/chains";
+import { ERC20_ABI, ERC20_APPROVE_ABI } from "./erc-abi";
+import { UptoEvmSchemeClient } from "./upto-evm-scheme";
 
 export async function invokeRustClient(
   endpoint: URL,
@@ -66,27 +70,98 @@ export async function invokeRustClient(
   return new TextDecoder().decode(stdout);
 }
 
+export const EIP155_ACCOUNT = privateKeyToAccount(
+  config.baseSepolia.buyerPrivateKey,
+);
+
 export async function makeFetch(
   chain: "eip155" | "solana",
 ): Promise<typeof fetch> {
   const client = new x402Client();
   switch (chain) {
     case "eip155": {
-      let signer = privateKeyToAccount(
-        config.baseSepolia.buyerPrivateKey,
-      );
-      registerExactEvmScheme(client, { signer });
+      client.register("eip155:*", new ExactEvmScheme(EIP155_ACCOUNT));
+      client.register("eip155:*", new UptoEvmSchemeClient(EIP155_ACCOUNT));
       break;
     }
     case "solana": {
       const keypair = await createKeyPairSignerFromBytes(
         base58.decode(config.solanaDevnet.buyerPrivateKey),
       );
-      registerExactSvmScheme(client, { signer: keypair });
+      client.register("solana:*", new ExactSvmScheme(keypair));
       break;
     }
     default:
       throw new Error(`Unsupported chain: ${chain}`);
   }
   return wrapFetchWithPayment(fetch, client);
+}
+
+// Create public client for Base Sepolia
+export const PUBLIC_CLIENT = createPublicClient({
+  chain: baseSepoliaPreconf,
+  transport: http(),
+});
+
+// Create wallet client for signing transactions
+export const WALLET_CLIENT = createWalletClient({
+  account: EIP155_ACCOUNT,
+  chain: baseSepoliaPreconf,
+  transport: http(),
+});
+
+export async function setAllowance(
+  tokenAddress: `0x${string}`,
+  spender: `0x${string}`,
+  amount: bigint,
+) {
+  const currentAllowance = await getAllowance(tokenAddress, spender);
+  if (currentAllowance === amount) {
+    return;
+  }
+
+  const approveTxHash = await WALLET_CLIENT.writeContract({
+    address: tokenAddress,
+    abi: ERC20_APPROVE_ABI,
+    functionName: "approve",
+    args: [spender, amount],
+  });
+  // Wait till the tx _lands_ onchain
+  while (true) {
+    const receipt = await PUBLIC_CLIENT.waitForTransactionReceipt({
+      hash: approveTxHash,
+      confirmations: 1,
+    });
+    if (
+      receipt.blockHash !==
+      "0x0000000000000000000000000000000000000000000000000000000000000000"
+    ) {
+      // Not a preconfirmation anymore
+      break;
+    }
+  }
+}
+
+export function getAllowance(
+  tokenAddress: `0x${string}`,
+  spender: `0x${string}`,
+): Promise<bigint> {
+  return PUBLIC_CLIENT.readContract({
+    address: tokenAddress,
+    abi: ERC20_ABI,
+    functionName: "allowance",
+    args: [EIP155_ACCOUNT.address, spender],
+  });
+}
+
+export function getBalance(
+  tokenAddress: `0x${string}`,
+  owner: `0x${string}`,
+): Promise<bigint> {
+  return PUBLIC_CLIENT.readContract({
+    address: tokenAddress,
+    abi: ERC20_ABI,
+    functionName: "balanceOf",
+    args: [owner],
+  });
 }

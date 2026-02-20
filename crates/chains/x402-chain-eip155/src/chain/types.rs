@@ -80,74 +80,25 @@ impl PartialEq<ChecksummedAddress> for Address {
     }
 }
 
-/// A token amount represented as a U256, serialized as a decimal string.
-///
-/// This wrapper ensures token amounts are serialized as decimal strings
-/// (e.g., `"1000000"`) rather than hex to maintain compatibility with
-/// the x402 protocol wire format and avoid precision issues in JSON.
-///
-/// # Example
-///
-/// ```
-/// use x402_chain_eip155::chain::TokenAmount;
-/// use alloy_primitives::U256;
-///
-/// let amount = TokenAmount(U256::from(1_000_000u64));
-/// let json = serde_json::to_string(&amount).unwrap();
-/// assert_eq!(json, "\"1000000\"");
-/// ```
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TokenAmount(pub U256);
+pub mod decimal_u256 {
+    use alloy_primitives::U256;
+    use serde::{Deserialize, Deserializer, Serializer};
 
-impl FromStr for TokenAmount {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let u256 = U256::from_str_radix(s, 10).map_err(|_| "invalid token amount".to_string())?;
-        Ok(Self(u256))
-    }
-}
-
-impl Serialize for TokenAmount {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    /// Serialize a U256 as a decimal string.
+    pub fn serialize<S>(value: &U256, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_str(&self.0.to_string())
+        serializer.serialize_str(&value.to_string())
     }
-}
 
-impl<'de> Deserialize<'de> for TokenAmount {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    /// Deserialize a decimal string into a U256.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<U256, D::Error>
     where
         D: Deserializer<'de>,
     {
         let s = String::deserialize(deserializer)?;
-        Self::from_str(&s).map_err(serde::de::Error::custom)
-    }
-}
-
-impl From<TokenAmount> for U256 {
-    fn from(value: TokenAmount) -> Self {
-        value.0
-    }
-}
-
-impl From<U256> for TokenAmount {
-    fn from(value: U256) -> Self {
-        Self(value)
-    }
-}
-
-impl From<u128> for TokenAmount {
-    fn from(value: u128) -> Self {
-        Self(U256::from(value))
-    }
-}
-
-impl From<u64> for TokenAmount {
-    fn from(value: u64) -> Self {
-        Self(U256::from(value))
+        U256::from_str_radix(&s, 10).map_err(serde::de::Error::custom)
     }
 }
 
@@ -280,8 +231,80 @@ pub struct Eip155TokenDeployment {
     pub address: Address,
     /// Number of decimal places for the token (e.g., 6 for USDC, 18 for most ERC-20s).
     pub decimals: u8,
-    /// Optional EIP-712 domain parameters for signature verification.
-    pub eip712: Option<TokenDeploymentEip712>,
+    /// The method used to transfer assets.
+    pub transfer_method: AssetTransferMethod,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize)]
+#[serde(tag = "assetTransferMethod")]
+pub enum AssetTransferMethod {
+    /// EIP-712 domain parameters for signature verification of EIP3009 transfers.
+    #[serde(rename = "eip3009")]
+    Eip3009 {
+        /// The token name as specified in the EIP-712 domain.
+        name: String,
+        /// The token version as specified in the EIP-712 domain.
+        version: String,
+    },
+    /// Permit2 transfer method.
+    #[serde(rename = "permit2")]
+    Permit2,
+}
+
+impl<'de> Deserialize<'de> for AssetTransferMethod {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // --- Wire types (private) ---
+
+        #[derive(Debug, Deserialize)]
+        #[serde(untagged)]
+        #[allow(dead_code)]
+        enum AssetTransferMethodWire {
+            // { "assetTransferMethod": "permit2" }
+            Permit2Tagged {
+                #[serde(rename = "assetTransferMethod")]
+                asset_transfer_method: Permit2Tag,
+            },
+            // { "assetTransferMethod": "eip3009", "name": "...", "version": "..." }
+            Eip3009Tagged {
+                #[serde(rename = "assetTransferMethod")]
+                asset_transfer_method: Eip3009Tag,
+                name: String,
+                version: String,
+            },
+            // { "name": "...", "version": "..." }  (implicit)
+            Eip3009Implicit {
+                name: String,
+                version: String,
+            },
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Permit2Tag {
+            Permit2,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        enum Eip3009Tag {
+            Eip3009,
+        }
+
+        let wire = AssetTransferMethodWire::deserialize(deserializer)
+            .map_err(|e| serde::de::Error::custom(format!("invalid asset transfer method: {e}")))?;
+
+        Ok(match wire {
+            AssetTransferMethodWire::Permit2Tagged { .. } => AssetTransferMethod::Permit2,
+
+            AssetTransferMethodWire::Eip3009Tagged { name, version, .. }
+            | AssetTransferMethodWire::Eip3009Implicit { name, version } => {
+                AssetTransferMethod::Eip3009 { name, version }
+            }
+        })
+    }
 }
 
 #[allow(dead_code)] // Public for consumption by downstream crates.
@@ -289,12 +312,9 @@ impl Eip155TokenDeployment {
     /// Creates a token amount from a raw value.
     ///
     /// The value should already be in the token's smallest unit (e.g., wei).
-    pub fn amount<V: Into<TokenAmount>>(
-        &self,
-        v: V,
-    ) -> DeployedTokenAmount<U256, Eip155TokenDeployment> {
+    pub fn amount<V: Into<u64>>(&self, v: V) -> DeployedTokenAmount<U256, Eip155TokenDeployment> {
         DeployedTokenAmount {
-            amount: v.into().0,
+            amount: U256::from(v.into()),
             token: self.clone(),
         }
     }
@@ -349,19 +369,6 @@ impl Eip155TokenDeployment {
     }
 }
 
-/// EIP-712 domain parameters for a token deployment.
-///
-/// These parameters are used when verifying EIP-712 typed data signatures
-/// for ERC-3009 `transferWithAuthorization` calls.
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-#[allow(dead_code)] // Public for consumption by downstream crates.
-pub struct TokenDeploymentEip712 {
-    /// The token name as specified in the EIP-712 domain.
-    pub name: String,
-    /// The token version as specified in the EIP-712 domain.
-    pub version: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,9 +377,12 @@ mod tests {
         let chain_ref = Eip155ChainReference::new(1); // Mainnet
         Eip155TokenDeployment {
             chain_reference: chain_ref,
-            address: alloy_primitives::Address::ZERO,
+            address: Address::ZERO,
             decimals,
-            eip712: None,
+            transfer_method: AssetTransferMethod::Eip3009 {
+                name: "TestToken".into(),
+                version: "2".into(),
+            },
         }
     }
 
